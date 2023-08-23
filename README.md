@@ -70,3 +70,23 @@ Also, to run the MuJoCo experiments, a license is required (see [here](https://w
 ./scripts/aclg_ant_maze_u_stoch.sh sparse 10e5 0 2
 ```
 
+- Large Ant Maze (U-shape)
+```
+./scripts/aclg_ant_maze_u_large.sh ${reward_shaping} ${timesteps} ${gpu} ${seed}
+./scripts/aclg_ant_maze_u_large.sh dense 12e5 0 2
+./scripts/aclg_ant_maze_u_large.sh sparse 12e5 0 2
+```
+
+- Ant Maze Bottleneck
+```
+./scripts/aclg_ant_maze_bottleneck.sh ${reward_shaping} ${timesteps} ${gpu} ${seed}
+./scripts/aclg_ant_maze_bottleneck.sh dense 7e5 0 2
+./scripts/aclg_ant_maze_bottleneck.sh sparse 7e5 0 2
+```
+
+- Ant Maze Complex
+```
+./scripts/aclg_ant_maze_complex.sh ${reward_shaping} ${timesteps} ${gpu} ${seed}
+./scripts/aclg_ant_maze_complex.sh dense 30e5 0 2
+./scripts/aclg_ant_maze_complex.sh sparse 30e5 0 2
+```

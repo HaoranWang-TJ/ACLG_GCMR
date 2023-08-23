@@ -4,7 +4,7 @@ GPU=$3
 SEED=$4
 
 CUDA_VISIBLE_DEVICES=${GPU} python main.py \
---env_name "AntMaze-v1" \
+--env_name "AntMazeBottleneck-v1" \
 --reward_shaping ${REWARD_SHAPING} \
 --algo aclg \
 --version "${REWARD_SHAPING}" \

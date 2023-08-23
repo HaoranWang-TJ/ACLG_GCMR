@@ -16,7 +16,7 @@ import gym
 from goal_env import *
 from goal_env.mujoco import *
 
-from envs import EnvWithGoal
+from envs import EnvWithGoal, TrainTestWrapper
 
 
 def evaluate_policy(env,
@@ -124,11 +124,17 @@ def run_higl(args):
             pickle.dump(args, f)
 
     if "Ant" in args.env_name:
-        step_style = args.reward_shaping == 'sparse'
-        env = EnvWithGoal(gym.make(args.env_name,
-                                   stochastic_xy=args.stochastic_xy,
-                                   stochastic_sigma=args.stochastic_sigma),
-                          env_name=args.env_name, step_style=step_style)
+        if "Bottleneck" in args.env_name:
+            step_style = args.reward_shaping == 'sparse'
+            _train_env = gym.make(args.env_name, sparse_style=step_style, evaluate=False)
+            _test_env = gym.make(args.env_name, sparse_style=step_style, evaluate=True)
+            env = TrainTestWrapper(_train_env, _test_env)
+        else:
+            step_style = args.reward_shaping == 'sparse'
+            env = EnvWithGoal(gym.make(args.env_name
+                                       , stochastic_xy=args.stochastic_xy
+                                       , stochastic_sigma=args.stochastic_sigma
+                                       ), env_name=args.env_name, step_style=step_style)
     elif "Point" in args.env_name:
         assert not args.stochastic_xy
         step_style = args.reward_shaping == 'sparse'
@@ -148,9 +154,10 @@ def run_higl(args):
         high = np.array([1., 1., 1., ])
         low = - high
     elif args.env_name in ["Pusher-v0"]:
-        high = np.array([2., 2., 2., 2., 2., 2.])
+        high = np.array([2., 2., 2., 2., 2.])
         low = - high
-    elif "AntMaze" in args.env_name or "PointMaze" in args.env_name:
+    elif "AntMaze" in args.env_name or "PointMaze" in args.env_name \
+        or "AntPush" in args.env_name:
         high = np.array((10., 10.))
         low = - high
     else:
@@ -187,7 +194,8 @@ def run_higl(args):
             f.write("{}: {}\n".format(arg, getattr(args, arg)))
     print("---------------------------------------\n")
 
-    torch.cuda.set_device(args.gid)
+    if int(args.gid) > 0:
+        torch.cuda.set_device(args.gid)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     file_name = "{}_{}_{}".format(args.env_name, args.algo, args.seed)
@@ -408,7 +416,8 @@ def run_higl(args):
                     writer.add_scalar("eval/avg_ep_rew", avg_ep_rew, total_timesteps)
                     writer.add_scalar("eval/avg_controller_rew", avg_controller_rew, total_timesteps)
 
-                    if "Maze" in args.env_name or args.env_name in ["Reacher3D-v0", "Pusher-v0"]:
+                    if "Maze" in args.env_name or "AntPush" in args.env_name\
+                        or args.env_name in ["Reacher3D-v0", "Pusher-v0"]:
                         writer.add_scalar("eval/avg_steps_to_finish", avg_steps, total_timesteps)
                         writer.add_scalar("eval/perc_env_goal_achieved", avg_env_finish, total_timesteps)
 
@@ -618,7 +627,9 @@ def run_higl(args):
     writer.add_scalar("eval/avg_ep_rew", avg_ep_rew, total_timesteps)
     writer.add_scalar("eval/avg_controller_rew", avg_controller_rew, total_timesteps)
 
-    if "Maze" in args.env_name or args.env_name in ["Reacher3D-v0", "Pusher-v0"]:
+    print(args.env_name)
+    if "Maze" in args.env_name or "AntPush" in args.env_name \
+        or args.env_name in ["Reacher3D-v0", "Pusher-v0"]:
         writer.add_scalar("eval/avg_steps_to_finish", avg_steps, total_timesteps)
         writer.add_scalar("eval/perc_env_goal_achieved", avg_env_finish, total_timesteps)
 

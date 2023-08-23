@@ -37,7 +37,10 @@ class PusherEnv(mujoco_env.MujocoEnv, utils.EzPickle):
             fail = False
         ob = self._get_obs()
         # self.ac_goal_pos = self.get_body_com("goal")
-        self.ac_goal_pos = np.concatenate((self.get_body_com("goal"), self.get_body_com("tips_arm")))
+        # TODO: validity check
+        self.ac_goal_pos = np.concatenate(
+            ((self.get_body_com("object")-self.get_body_com("goal"))[..., :2], self.get_body_com("tips_arm")-self.get_body_com("object"))
+        )
 
         return ob, - float(fail) + reward_ctrl, self.num_timesteps >= 100, {'is_success': not fail}
 
@@ -61,18 +64,25 @@ class PusherEnv(mujoco_env.MujocoEnv, utils.EzPickle):
         # self.ac_goal_pos = self.get_body_com("goal")
         # self.goal = self.get_body_com("object")
 
-        self.ac_goal_pos = np.concatenate((self.get_body_com("goal"), self.get_body_com("tips_arm")))
-        self.goal = np.concatenate((self.get_body_com("object"), self.get_body_com("object")))
+        # TODO: validity check
+        self.ac_goal_pos = np.concatenate(
+            ((self.get_body_com("object")-self.get_body_com("goal"))[..., :2], self.get_body_com("tips_arm")-self.get_body_com("object"))
+        )
+        self.goal = np.concatenate(
+            (np.zeros(2), np.zeros_like(self.get_body_com("goal")))
+        )
 
         return self._get_obs()
 
     def _get_obs(self):
-        return np.concatenate([
-            self.data.qpos.flat[:7],
-            self.data.qvel.flat[:7],
-            self.get_body_com("tips_arm"),
-            self.get_body_com("object"),
-        ])
+        return np.concatenate(
+            [
+                (self.get_body_com("object")-self.get_body_com("goal"))[..., :2],
+                self.get_body_com("tips_arm")-self.get_body_com("object"),
+                self.data.qpos.flat[:7],
+                self.data.qvel.flat[:7],
+            ]
+        )
 
     def reset(self):
         self.num_timesteps = 0

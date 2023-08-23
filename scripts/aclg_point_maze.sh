@@ -17,6 +17,5 @@ CUDA_VISIBLE_DEVICES=${GPU} python main.py \
 --use_novelty_landmark \
 --novelty_algo rnd \
 --n_landmark_novelty 60 \
---delta 0.5 \
---adj_factor 0.7 \
---seed ${SEED}
+--delta 2.0 \
+--adj_factor 0.7

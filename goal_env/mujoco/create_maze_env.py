@@ -107,6 +107,8 @@ def create_maze_env(env_name=None, top_down_view=False, maze_size_scaling=8, ran
         observe_blocks = True
     elif env_name == 'MazeW':
         maze_id = 'MazeW'
+    elif env_name == 'MazeComplex':
+        maze_id = 'MazeComplex'
     else:
         raise ValueError('Unknown maze environment %s' % env_name)
 
