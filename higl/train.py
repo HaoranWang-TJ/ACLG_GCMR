@@ -278,7 +278,7 @@ def run_higl(args):
     adj_mat_size = 1000
     adj_mat = np.diag(np.ones(adj_mat_size, dtype=np.uint8))
     traj_buffer = utils.TrajectoryBuffer(capacity=args.traj_buffer_size)
-    if args.algo in ['higl', 'hrac']:
+    if args.algo in ['higl', 'hrac', 'aclg']:
         a_net = ANet(controller_goal_dim, args.r_hidden_dim, args.r_embedding_dim)
         if args.load_adj_net:
             print("Loading adjacency network...")
@@ -318,7 +318,7 @@ def run_higl(args):
     ep_ac_seq = None
 
     # Novelty PQ and novelty algorithm
-    if args.algo == 'higl' and args.use_novelty_landmark:
+    if args.algo in ['higl', 'aclg'] and args.use_novelty_landmark:
         if args.novelty_algo == 'rnd':
             novelty_pq = utils.PriorityQueue(args.n_landmark_novelty,
                                              close_thr=args.close_thr,
@@ -337,7 +337,7 @@ def run_higl(args):
             # Update Novelty Priority Queue
             if ep_obs_seq is not None:
                 assert ep_ac_seq is not None
-                if args.algo == 'higl' and args.use_novelty_landmark:
+                if args.algo in ['higl', 'aclg'] and args.use_novelty_landmark:
                     if args.novelty_algo == 'rnd':
                         if args.use_ag_as_input:
                             novelty = RND.get_novelty(np.array(ep_ac_seq).copy())
@@ -429,11 +429,11 @@ def run_higl(args):
                         controller_buffer.save(args.save_replay_buffer + "_controller")
 
                 # Train adjacency network
-                if args.algo in ["higl", "hrac"]:
+                if args.algo in ["higl", "hrac", "aclg"]:
                     if traj_buffer.full():
                         for traj in traj_buffer.get_trajectory():
                             for i in range(len(traj)):
-                                adj_factor = args.adj_factor if args.algo == "higl" else 1
+                                adj_factor = args.adj_factor if args.algo in ['higl', 'aclg'] else 1
                                 for j in range(1, min(int(args.manager_propose_freq * adj_factor), len(traj) - i)):
                                     s1 = tuple(np.round(traj[i]).astype(np.int32))
                                     s2 = tuple(np.round(traj[i + j]).astype(np.int32))

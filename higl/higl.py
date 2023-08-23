@@ -175,7 +175,9 @@ class Manager(object):
             batch_landmarks, scaled_norm_direction = self.get_pseudo_landmark(achieved_goal, selected_landmark)
         ld_loss = torch.clamp(F.pairwise_distance(a_net(batch_landmarks), a_net(gen_subgoal)) - r_margin, min=0.).mean()
 
-        return eval + norm, goal_loss, ld_loss, scaled_norm_direction  # HIGL
+        follow_loss = F.mse_loss(batch_landmarks, gen_subgoal).mean()
+
+        return eval + norm, goal_loss, ld_loss, follow_loss, scaled_norm_direction  # HIGL
 
     def off_policy_corrections(self, controller_policy, batch_size, subgoals, x_seq, a_seq, ag_seq):
         first_ag = [x[0] for x in ag_seq]
@@ -238,10 +240,10 @@ class Manager(object):
               novelty_pq=None,
               ):
         self.manager_buffer = replay_buffer
-        avg_act_loss, avg_crit_loss, avg_goal_loss, avg_ld_loss, avg_bonus, avg_norm_sel = 0., 0., 0., 0., 0., 0.
+        avg_act_loss, avg_crit_loss, avg_goal_loss, avg_ld_loss, avg_floss, avg_norm_sel = 0., 0., 0., 0., 0., 0.
         avg_scaled_norm_direction = get_tensor(np.array([0.] * self.action_dim)).squeeze()
 
-        if algo == 'higl' and self.planner is None and total_timesteps >= self.planner_start_step:
+        if algo in ['higl', 'aclg'] and self.planner is None and total_timesteps >= self.planner_start_step:
             self.init_planner()
 
         for it in range(iterations):
@@ -297,7 +299,7 @@ class Manager(object):
                 actor_loss = actor_loss + self.goal_loss_coeff * goal_loss
                 avg_goal_loss += goal_loss
 
-            elif algo == "higl":
+            elif algo in ['higl', 'aclg']:
                 assert a_net is not None
 
                 if self.planner is None:  # If planner is not ready
@@ -314,13 +316,19 @@ class Manager(object):
                         ag2sel = np.linalg.norm(selected_landmark.cpu().numpy() - ag, axis=1).mean()
                         self.set_delta(ag2sel)
 
-                actor_loss, goal_loss, ld_loss, scaled_norm_direction = self.actor_loss(state, achieved_goal, goal,
+                actor_loss, goal_loss, ld_loss, follow_loss, scaled_norm_direction = self.actor_loss(state, achieved_goal, goal,
                                                                                         a_net, r_margin,
                                                                                         selected_landmark,
                                                                                         self.no_pseudo_landmark)
-                actor_loss = actor_loss + self.landmark_loss_coeff * ld_loss
+                if algo == "higl":
+                    actor_loss = actor_loss + self.landmark_loss_coeff * ld_loss
+                elif algo == "aclg":
+                    actor_loss = actor_loss + self.goal_loss_coeff * goal_loss + self.landmark_loss_coeff * follow_loss
+                else:
+                    raise NotImplementedError
                 avg_goal_loss += goal_loss
                 avg_ld_loss += ld_loss
+                avg_floss += follow_loss
                 avg_scaled_norm_direction += scaled_norm_direction
             else:
                 raise NotImplementedError

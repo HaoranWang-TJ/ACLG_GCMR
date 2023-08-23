@@ -1,14 +1,16 @@
 ENV=$1
 TIMESTEPS=$2
-GPU=$2
-SEED=$3
+GPU=$3
+SEED=$4
 
 CUDA_VISIBLE_DEVICES=${GPU} python main.py \
 --absolute_goal \
 --delta 1.0 \
 --env_name ${ENV} \
 --reward_shaping "sparse" \
---algo higl \
+--algo aclg \
+--goal_loss_coeff 0 \
+--landmark_loss_coeff 1 \
 --seed ${SEED} \
 --max_timesteps  ${TIMESTEPS} \
 --manager_propose_freq 5 \

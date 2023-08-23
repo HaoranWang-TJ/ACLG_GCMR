@@ -10,7 +10,7 @@ parser.add_argument("--reward_shaping", type=str, default="dense", choices=["den
 parser.add_argument("--stochastic_xy", action="store_true")
 parser.add_argument("--stochastic_sigma", default=0., type=float)
 parser.add_argument("--gid", type=int, default=0)
-parser.add_argument("--algo", default="higl", type=str, choices=["higl", "hrac", "hiro"])
+parser.add_argument("--algo", default="aclg", type=str, choices=["higl", "hrac", "hiro", "aclg"])
 parser.add_argument("--seed", default=2, type=int)
 parser.add_argument("--eval_freq", default=5e3, type=float)
 parser.add_argument("--max_timesteps", default=5e6, type=float)
