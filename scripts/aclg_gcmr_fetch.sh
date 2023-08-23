@@ -3,12 +3,33 @@ TIMESTEPS=$2
 GPU=$3
 SEED=$4
 
+# The hyperparameters associated with method A are marked with backslash (\\**\\)
+
 CUDA_VISIBLE_DEVICES=${GPU} python main.py \
 --absolute_goal \
 --delta 1.0 \
 --env_name ${ENV} \
 --reward_shaping "sparse" \
 --algo aclg \
+\
+\
+--correction_type m-OPC \
+--use_model_based_rollout \
+--fkm_hidden_size 256 \
+--fkm_hidden_layer_num 3 \
+--fkm_network_num 5 \
+--fkm_batch_size 512 \
+--fkm_lr 0.005 \
+--fkm_obj_start_step 10000 \
+--train_fkm_freq 500 \
+--osp_delta 10 \
+--osp_delta_update_rate 0.01 \
+--rollout_exp_w 0.95 \
+--ctrl_mgp_lambda 1.0  \
+--ctrl_osrp_lambda 0.0005 \
+--ctrl_gcmr_start_step 10000 \
+\
+\
 --goal_loss_coeff 0 \
 --landmark_loss_coeff 1 \
 --seed ${SEED} \
@@ -29,4 +50,4 @@ CUDA_VISIBLE_DEVICES=${GPU} python main.py \
 --close_thr 0.02 \
 --clip_v -15 \
 --goal_thr -5 \
---version "sparse"
+--version "sparse_gcmr"

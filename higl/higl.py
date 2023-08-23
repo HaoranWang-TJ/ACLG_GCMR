@@ -5,6 +5,8 @@ import torch.nn.functional as F
 import numpy as np
 
 from higl.models import ControllerActor, ControllerCritic, ManagerActor, ManagerCritic, RndPredictor
+from higl.relabel import OffPolicyCorrections, HindsightRelabeling
+from higl.utils import AutoLambda
 # from higl.utils import RunningMeanStd
 from planner.goal_plan import Planner
 
@@ -52,6 +54,9 @@ class Manager(object):
                  n_landmark_cov=20,
                  planner_initial_sample=1000,
                  planner_goal_thr=-10.,
+                 init_opc_delta=0,
+                 opc_delta_update_rate=0,
+                 correction_type=0,
                  ):
         self.scale = scale
         self.actor = ManagerActor(state_dim,
@@ -109,6 +114,9 @@ class Manager(object):
         self.n_landmark_cov = n_landmark_cov
         self.planner_initial_sample = planner_initial_sample
         self.planner_goal_thr = planner_goal_thr
+
+        self.opc_delta_f = AutoLambda(init_opc_delta, opc_delta_update_rate)
+        self.correction_type = correction_type
 
     def init_planner(self):
         self.planner = Planner(landmark_cov_sampling=self.planner_cov_sampling,
@@ -179,51 +187,43 @@ class Manager(object):
 
         return eval + norm, goal_loss, ld_loss, follow_loss, scaled_norm_direction  # HIGL
 
-    def off_policy_corrections(self, controller_policy, batch_size, subgoals, x_seq, a_seq, ag_seq):
-        first_ag = [x[0] for x in ag_seq]
-        last_ag = [x[-1] for x in ag_seq]
+    def select_subgoal(self, state, goal, to_numpy=True):
+        if not torch.is_tensor(state):
+            state = get_tensor(state)
+        if not torch.is_tensor(goal):
+            goal = get_tensor(goal)
 
-        # Shape: (batchsz, 1, subgoal_dim)
-        diff_goal = (np.array(last_ag) - np.array(first_ag))[:, np.newaxis, ]
+        if to_numpy:
+            return self.actor(state, goal).cpu().data.numpy().squeeze()
+        else:
+            return self.actor(state, goal).squeeze()
 
-        # Shape: (batchsz, 1, subgoal_dim)
-        original_goal = np.array(subgoals)[:, np.newaxis, :]
-        random_goals = np.random.normal(loc=diff_goal,
-                                        scale=.5*self.scale[None, None, :self.action_dim],
-                                        size=(batch_size, self.candidate_goals, original_goal.shape[-1]))
-        random_goals = random_goals.clip(-self.scale[:self.action_dim], self.scale[:self.action_dim])
+    def goal_relabeling(self, controller_policy, batch_size, subgoals, x_seq, a_seq, ag_seq, goals, fkm_obj=None, exp_w=1.0):
+        if self.correction_type == 'm-OPC':
+            opc_obj = OffPolicyCorrections(self.absolute_goal, controller_policy, batch_size, subgoals.copy(), x_seq, a_seq, ag_seq, self.candidate_goals, self.scale, self.action_dim, fkm_obj)
+            relabeled_goals = opc_obj.get_corrected_goals(exp_w)
+        elif self.correction_type == 'OSP':
+            hr_obj = HindsightRelabeling(self.absolute_goal, self, controller_policy, batch_size, subgoals.copy(), x_seq, ag_seq, goals, self.scale, self.action_dim, fkm_obj)
+            relabeled_goals = hr_obj.get_relabeled_goals()
+        elif self.correction_type == 'OPC':
+            opc_obj = OffPolicyCorrections(self.absolute_goal, controller_policy, batch_size, subgoals.copy(), x_seq, a_seq, ag_seq, self.candidate_goals, self.scale, self.action_dim, None)
+            relabeled_goals = opc_obj.get_corrected_goals(exp_w)
+        elif self.correction_type == 'HAC':
+            hr_obj = HindsightRelabeling(self.absolute_goal, self, controller_policy, batch_size, subgoals.copy(), x_seq, ag_seq, goals, self.scale, self.action_dim, None)
+            relabeled_goals = hr_obj.get_relabeled_goals()
+        else:
+            return subgoals
 
-        # Shape: (batchsz, 10, subgoal_dim)
-        candidates = np.concatenate([original_goal, diff_goal, random_goals], axis=1)
-        x_seq = np.array(x_seq)[:, :-1, :]
-        a_seq = np.array(a_seq)
-        seq_len = len(x_seq[0])
+        if not self.opc_delta_f.enable:
+            return np.vstack(relabeled_goals)
 
-        # For ease
-        new_batch_sz = seq_len * batch_size
-        action_dim = a_seq[0][0].shape
-        obs_dim = x_seq[0][0].shape
-        ncands = candidates.shape[1]
-
-        true_actions = a_seq.reshape((new_batch_sz,) + action_dim)
-        observations = x_seq.reshape((new_batch_sz,) + obs_dim)
-        goal_shape = (new_batch_sz, self.action_dim)
-
-        policy_actions = np.zeros((ncands, new_batch_sz) + action_dim)
-
-        for c in range(ncands):
-            candidate = controller_policy.multi_subgoal_transition(np.array(ag_seq)[:, :-1, :], candidates[:, c])
-            candidate = candidate.reshape(*goal_shape)
-            policy_actions[c] = controller_policy.select_action(observations, candidate)
-
-        difference = (policy_actions - true_actions)
-        difference = np.where(difference != -np.inf, difference, 0)
-        difference = difference.reshape((ncands, batch_size, seq_len) + action_dim).transpose(1, 0, 2, 3)
-
-        logprob = -0.5*np.sum(np.linalg.norm(difference, axis=-1)**2, axis=-1)
-        max_indices = np.argmax(logprob, axis=-1)
-
-        return candidates[np.arange(batch_size), max_indices]
+        vec_norm = lambda x: x / (np.linalg.norm(x) + 1e-7)
+        sg_direction = vec_norm(relabeled_goals - subgoals)
+        if self.opc_delta_f.is_dynamic:
+            self.opc_delta_f.update(np.linalg.norm(relabeled_goals - subgoals, axis=1).mean())
+        solf_subgoals = subgoals + self.opc_delta_f.value * sg_direction
+        solf_subgoals = solf_subgoals.clip(-self.scale[:self.action_dim], self.scale[:self.action_dim])
+        return solf_subgoals
 
     def train(self,
               algo,
@@ -238,6 +238,8 @@ class Manager(object):
               r_margin=None,
               total_timesteps=None,
               novelty_pq=None,
+              fkm_obj=None,
+              exp_w=1.0,
               ):
         self.manager_buffer = replay_buffer
         avg_act_loss, avg_crit_loss, avg_goal_loss, avg_ld_loss, avg_floss, avg_norm_sel = 0., 0., 0., 0., 0., 0.
@@ -250,8 +252,8 @@ class Manager(object):
             # Sample replay buffer
             x, y, ag, ag_next, g, sgorig, r, d, xobs_seq, a_seq, ag_seq = replay_buffer.sample(batch_size)
 
-            if self.correction and not self.absolute_goal:
-                sg = self.off_policy_corrections(controller_policy, batch_size, sgorig, xobs_seq, a_seq, ag_seq)
+            if self.correction:
+                sg = self.goal_relabeling(controller_policy, batch_size, sgorig, xobs_seq, a_seq, ag_seq, g, fkm_obj=fkm_obj, exp_w=exp_w)
             else:
                 sg = sgorig
 
@@ -326,6 +328,7 @@ class Manager(object):
                     actor_loss = actor_loss + self.goal_loss_coeff * goal_loss + self.landmark_loss_coeff * follow_loss
                 else:
                     raise NotImplementedError
+
                 avg_goal_loss += goal_loss
                 avg_ld_loss += ld_loss
                 avg_floss += follow_loss
@@ -352,6 +355,7 @@ class Manager(object):
                avg_crit_loss / iterations, \
                avg_goal_loss / iterations, \
                avg_ld_loss / iterations,\
+               avg_floss / iterations,\
                avg_scaled_norm_direction / iterations
 
     def load_pretrained_weights(self, filename):
@@ -397,6 +401,8 @@ class Controller(object):
                  policy_noise=0.2,
                  noise_clip=0.5,
                  absolute_goal=False,
+                 man_policy_noise=0.2,
+                 man_policy_noise_clip=0.5,
     ):
         self.actor = ControllerActor(state_dim, goal_dim, action_dim, scale=max_action)
         self.actor_target = ControllerActor(state_dim, goal_dim, action_dim, scale=max_action)
@@ -429,6 +435,12 @@ class Controller(object):
 
         self.device = device
 
+        self._auto_upperbounded_k = 0.
+        self.man_policy_noise = man_policy_noise
+        self.man_policy_noise_clip = man_policy_noise_clip
+        self.osrp_interval = 0
+        self.mgp_interval = 0
+
     def clean_obs(self, state, dims=2):
         if self.no_xy:
             with torch.no_grad():
@@ -445,8 +457,10 @@ class Controller(object):
             return state
 
     def select_action(self, state, sg, to_numpy=True):
-        state = get_tensor(state)
-        sg = get_tensor(sg)
+        if not torch.is_tensor(state):
+            state = get_tensor(state)
+        if not torch.is_tensor(sg):
+            sg = get_tensor(sg)
         state = self.clean_obs(state)
 
         if to_numpy:
@@ -460,8 +474,63 @@ class Controller(object):
         action = get_tensor(action)
         return self.critic(state, sg, action)
 
-    def actor_loss(self, state, sg):
-        return -self.critic.Q1(state, sg, self.actor(state, sg)).mean()
+    def _get_osrp_loss(self, fkm_obj, manage_replay_buffer, manage_actor, manage_critic, batch_size, sg_scale):
+        # x, g, sg
+        # Sample replay buffer
+        _curr_state, _, _, _, _dg, _sgorig, _, _, _, _, _ = manage_replay_buffer.sample(batch_size)
+        _curr_state = _curr_state.repeat(100, 0)
+        _dg = _dg.repeat(10, 0)
+        np.random.shuffle(_dg)
+        _dg = _dg.repeat(10, 0)
+        _curr_state = get_tensor(_curr_state)
+        _dg = get_tensor(_dg)
+
+        if sg_scale is None:
+            _sgorig = _sgorig.repeat(100, 0)
+            _sgorig = _sgorig + np.random.rand(*_sgorig.shape) * 2 - 1
+        else:
+            _sgorig = np.random.normal(loc=manage_actor(_curr_state, _dg).cpu().data.numpy(),
+                                        scale=.5*sg_scale)
+            _sgorig = _sgorig.clip(-sg_scale, sg_scale)
+        _sgorig = get_tensor(_sgorig)
+
+        _action = self.actor(self.clean_obs(_curr_state), _sgorig)
+        _state_delta = fkm_obj(_curr_state, _action, batch_size=batch_size)
+        _next_s = _curr_state + _state_delta
+
+        if fkm_obj.scaler.obs_max is not None and fkm_obj.scaler.obs_min is not None:
+            _next_s = _next_s.clamp(get_tensor(fkm_obj.scaler.obs_min), get_tensor(fkm_obj.scaler.obs_max))
+
+        if self.absolute_goal:
+            _new_sg = _sgorig
+        else:
+            _new_sg = _sgorig + _curr_state[:, :_sgorig.size(1)] - _next_s[:, :_sgorig.size(1)]
+        _target_Q1, _target_Q2 = manage_critic(_next_s, _dg, _new_sg)
+        _target_Q = torch.min(_target_Q1, _target_Q2)
+        actor_osrp_loss = - _target_Q.mean()
+
+        _new_sg_man = manage_actor(_next_s, _dg)
+        _new_sg_man_noise = np.random.normal(loc=np.zeros(_new_sg_man.size()), scale=self.man_policy_noise)
+        _new_sg_man_noise = _new_sg_man_noise.clip(-self.man_policy_noise_clip, self.man_policy_noise_clip)
+        _new_sg_man = _new_sg_man + get_tensor(_new_sg_man_noise)
+        _new_sg_man = _new_sg_man.clamp(get_tensor(-sg_scale), get_tensor(sg_scale))
+        _target_Q1_man, _target_Q2_man = manage_critic(_next_s, _dg, _new_sg_man)
+        _target_Q_man = torch.min(_target_Q1_man, _target_Q2_man)
+        actor_osrp_man_loss = - _target_Q_man.mean()
+
+        return 0.5 * (actor_osrp_loss + actor_osrp_man_loss)
+
+    def actor_loss(self, state, sg, fkm_obj=None, state_f=None \
+                   , osrp_lambda=.0, manage_replay_buffer=None, manage_actor=None, manage_critic=None, batch_size=256, sg_scale=None):
+        actions = self.actor(state, sg)
+        act_Q = self.critic.Q1(state, sg, actions)
+        act_loss = -1 * act_Q.mean()
+        osrp_loss = .0
+
+        if fkm_obj is not None and fkm_obj.trained and state_f is not None and manage_actor is not None and manage_critic is not None:
+            osrp_loss = osrp_lambda * self._get_osrp_loss(fkm_obj, manage_replay_buffer, manage_actor, manage_critic, batch_size=batch_size, sg_scale=sg_scale)
+
+        return act_loss, osrp_loss
 
     def subgoal_transition(self, achieved_goal, subgoal, next_achieved_goal):
         if self.absolute_goal:
@@ -476,9 +545,16 @@ class Controller(object):
         subgoals = (subgoal + achieved_goal[:, 0, ])[:, None] - achieved_goal[:, :, ]
         return subgoals
 
-    def train(self, replay_buffer, iterations, batch_size=100, discount=0.99, tau=0.005):
+    def train(self, replay_buffer, iterations, batch_size=100, discount=0.99, tau=0.005, fkm_obj=None, mgp_lambda=.0, \
+              osrp_lambda=.0, manage_replay_buffer=None, manage_actor=None, manage_critic=None, sg_scale=None):
 
-        avg_act_loss, avg_crit_loss = 0., 0.
+        avg_act_loss = dict({'avg_act_loss': 0., 'avg_act_osrp_loss': 0.})
+        avg_crit_loss = dict({'avg_crit_loss': 0., 'avg_mgp_loss': 0.})
+
+        use_mgp = mgp_lambda > 0 and fkm_obj is not None and fkm_obj.trained
+        extend_train_scale = 5
+        if use_mgp:
+            iterations = iterations * extend_train_scale
 
         for it in range(iterations):
             # Sample replay buffer
@@ -510,30 +586,88 @@ class Controller(object):
             critic_loss = self.criterion(current_Q1, target_Q_no_grad) +\
                           self.criterion(current_Q2, target_Q_no_grad)
 
+            # critic GP
+            if use_mgp and self.mgp_interval >= 5:
+                _state_rep = state.clone().detach().repeat(16, 1).requires_grad_(True)
+                _sg = sg.clone().detach().repeat(16, 1).requires_grad_(True)
+                _random_action = torch.rand(
+                    size=self.actor(_state_rep, _sg).size(),
+                    requires_grad=True) * 2 - 1.0
+                _random_action= _random_action.to(self.device)
+                _current_Q1, _current_Q2 = self.critic(_state_rep, _sg, _random_action)
+                grad_q1_wrt_random_action = torch.autograd.grad(
+                    outputs=_current_Q1.sum(),
+                    inputs =_random_action,
+                    create_graph=True)[0].norm(p=2, dim=-1)
+                grad_q2_wrt_random_action = torch.autograd.grad(
+                    outputs=_current_Q2.sum(),
+                    inputs =_random_action,
+                    create_graph=True)[0].norm(p=2, dim=-1)
+
+                _global_state = get_tensor(x).clone().detach().repeat(16, 1).requires_grad_(True)
+                _state_delta = fkm_obj(_global_state, _random_action, batch_size=len(_global_state))
+                if not self.absolute_goal:
+                    delta_rwd = torch.autograd.grad(
+                        outputs=(_state_delta[:, :_sg.size(1)]-_sg).norm(p=2, dim=-1).sum(),
+                        inputs=_random_action,
+                        create_graph=False)[0].norm(p=2, dim=-1).max()
+                else:
+                    delta_rwd = torch.autograd.grad(
+                        outputs=(_global_state[:, :_sg.size(1)] + _state_delta[:, :_sg.size(1)]-_sg).norm(p=2, dim=-1).sum(),
+                        inputs=_random_action,
+                        create_graph=False)[0].norm(p=2, dim=-1).max()
+
+                self._auto_upperbounded_k = np.math.sqrt(_random_action.size(1)) / (1 - discount) * delta_rwd.detach() / len(_global_state)
+
+                grad_q_wrt_random_action = F.relu(grad_q1_wrt_random_action - self._auto_upperbounded_k) **2 +\
+                        F.relu(grad_q2_wrt_random_action - self._auto_upperbounded_k) **2
+                mgp_loss = mgp_lambda * grad_q_wrt_random_action.mean()
+                avg_crit_loss['avg_mgp_loss'] += mgp_loss
+                critic_loss += mgp_loss
+
+                self.mgp_interval = 0
+            else:
+                self.mgp_interval += 1
+
             # Optimize the critic
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
             self.critic_optimizer.step()
 
-            # Compute actor loss
-            actor_loss = self.actor_loss(state, sg)
-
-            # Optimize the actor
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
-
-            avg_act_loss += actor_loss
-            avg_crit_loss += critic_loss
-
+            avg_crit_loss['avg_crit_loss'] += critic_loss
             # Update the target models
             for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            if it % extend_train_scale == extend_train_scale - 1:
+                # Compute actor loss
+                act_loss, osrp_loss = self.actor_loss(state, sg, fkm_obj=fkm_obj , state_f=get_tensor(x)
+                                            , osrp_lambda=osrp_lambda if self.osrp_interval >= 10 else 0.
+                                            , manage_replay_buffer=manage_replay_buffer, manage_actor=manage_actor if self.osrp_interval >= 10 else None
+                                            , manage_critic=manage_critic if self.osrp_interval >= 10 else None, batch_size=batch_size, sg_scale=sg_scale)
+                if (osrp_loss - .0) > 1e-7:
+                    self.osrp_interval = 0
+                else:
+                    self.osrp_interval += 1
 
-        return avg_act_loss / iterations, avg_crit_loss / iterations,
+                avg_act_loss['avg_act_osrp_loss'] += osrp_loss
+                actor_loss = act_loss + osrp_loss
+
+                # Optimize the actor
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor_optimizer.step()
+
+                avg_act_loss['avg_act_loss'] += actor_loss
+                for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                    target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+        for key in avg_act_loss:
+            avg_act_loss[key] /= iterations / (extend_train_scale if use_mgp else 1)
+        for key in avg_crit_loss:
+            avg_crit_loss[key] /= iterations
+
+        return avg_act_loss, avg_crit_loss
 
     def save(self, dir, env_name, algo, version, seed):
         torch.save(self.actor.state_dict(), "{}/{}_{}_{}_{}_ControllerActor.pth".format(dir, env_name, algo, version, seed))

@@ -11,6 +11,7 @@ from collections import OrderedDict
 import higl.utils as utils
 import higl.higl as higl
 from higl.models import ANet
+from higl.fkm import FKMInterface
 
 import gym
 from goal_env import *
@@ -227,6 +228,17 @@ def run_higl(args):
                                            reward_scale=args.ctrl_rew_scale)
     manager_buffer = utils.ReplayBuffer(maxsize=args.man_buffer_size)
 
+    # Forward Kinematic Model
+    fkm_obj = FKMInterface(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        hidden_size=args.fkm_hidden_size,
+        hidden_layer_num=args.fkm_hidden_layer_num,
+        network_num=args.fkm_network_num,
+        lr=args.fkm_lr,
+    )
+    fkm_obj_last_train_step = 0
+
     controller_policy = higl.Controller(
         state_dim=state_dim,
         goal_dim=controller_goal_dim,
@@ -238,6 +250,8 @@ def run_higl(args):
         absolute_goal=args.absolute_goal,
         policy_noise=train_ctrl_policy_noise,
         noise_clip=train_ctrl_noise_clip,
+        man_policy_noise=train_man_policy_noise,
+        man_policy_noise_clip=train_man_noise_clip,
     )
 
     manager_policy = higl.Manager(
@@ -264,6 +278,9 @@ def run_higl(args):
         n_landmark_cov=args.n_landmark_coverage,
         planner_initial_sample=args.initial_sample,
         planner_goal_thr=args.goal_thr,
+        init_opc_delta=args.osp_delta,
+        opc_delta_update_rate=args.osp_delta_update_rate,
+        correction_type=args.correction_type,
     )
 
     if args.noise_type == "ou":
@@ -340,7 +357,94 @@ def run_higl(args):
         novelty_pq = None
         RND = None
 
+    ctrl_lossls = utils.LossesList()
+    man_lossls = utils.LossesList()
+    skip_ctrl_train = 0
     while total_timesteps < args.max_timesteps:
+        if total_timesteps != 0 and not just_loaded and \
+            args.step_update and total_timesteps % args.step_update_interval == 0 and len(controller_buffer) >= 5 * args.ctrl_batch_size:
+            # Train controller
+            use_mgp = args.ctrl_mgp_lambda > 0 and args.use_model_based_rollout and total_timesteps >= args.ctrl_gcmr_start_step
+            use_osrp = args.ctrl_osrp_lambda > 0 and args.use_model_based_rollout and total_timesteps >= args.ctrl_gcmr_start_step
+            ctrl_act_loss, ctrl_crit_loss = controller_policy.train(controller_buffer,
+                                                                    args.step_update_interval,
+                                                                    batch_size=args.ctrl_batch_size,
+                                                                    discount=args.ctrl_discount,
+                                                                    tau=args.ctrl_tau,
+                                                                    fkm_obj=fkm_obj if (use_mgp or use_osrp) else None,
+                                                                    mgp_lambda=args.ctrl_mgp_lambda if use_mgp else .0,
+                                                                    osrp_lambda=args.ctrl_osrp_lambda if use_osrp else .0,
+                                                                    manage_replay_buffer=manager_buffer if use_osrp else None,
+                                                                    manage_actor=manager_policy.actor if use_osrp else None,
+                                                                    manage_critic=manager_policy.critic if use_osrp else None,
+                                                                    sg_scale=man_scale,
+                                                                    )
+            skip_ctrl_train += args.step_update_interval
+
+            if episode_num % 10 == 0:
+                print("Controller actor loss: {:.3f}".format(ctrl_act_loss['avg_act_loss']))
+                print("Controller critic loss: {:.3f}".format(ctrl_crit_loss['avg_crit_loss']))
+
+            if len(ctrl_lossls) >= ceil(1000 / args.step_update_interval):
+                writer.add_scalar("data/controller_actor_loss", ctrl_lossls.mean('data/controller_actor_loss'), total_timesteps)
+                writer.add_scalar("data/controller_actor_osrp_loss", ctrl_lossls.mean('data/controller_actor_osrp_loss'), total_timesteps)
+                writer.add_scalar("data/controller_critic_loss", ctrl_lossls.mean('data/controller_critic_loss'), total_timesteps)
+                writer.add_scalar("data/controller_mgp_loss", ctrl_lossls.mean('data/controller_mgp_loss'), total_timesteps)
+                writer.add_scalar("data/controller_auto_upperbounded_k", ctrl_lossls.mean('data/controller_auto_upperbounded_k'), total_timesteps)
+                writer.add_scalar("data/controller_ep_rew", ctrl_lossls.mean('data/controller_ep_rew'), total_timesteps)
+                ctrl_lossls.reset()
+            else:
+                ctrl_lossls.push("data/controller_actor_loss", ctrl_act_loss['avg_act_loss'])
+                ctrl_lossls.push("data/controller_actor_osrp_loss", ctrl_act_loss['avg_act_osrp_loss'])
+                ctrl_lossls.push("data/controller_critic_loss", ctrl_crit_loss['avg_crit_loss'])
+                ctrl_lossls.push("data/controller_mgp_loss", ctrl_crit_loss['avg_mgp_loss'])
+                ctrl_lossls.push("data/controller_auto_upperbounded_k", controller_policy._auto_upperbounded_k)
+                ctrl_lossls.push("data/controller_ep_rew", episode_reward)
+
+            # Train manager
+            if skip_ctrl_train >= args.train_manager_freq and len(manager_buffer) >= 5 * args.man_batch_size:
+                r_margin = (args.r_margin_pos + args.r_margin_neg) / 2
+
+                man_act_loss, man_crit_loss, man_goal_loss, man_ld_loss, man_floss, avg_scaled_norm_direction = \
+                    manager_policy.train(args.algo,
+                                            controller_policy,
+                                            manager_buffer,
+                                            controller_buffer,
+                                            ceil(skip_ctrl_train / args.train_manager_freq),
+                                            batch_size=args.man_batch_size,
+                                            discount=args.discount,
+                                            tau=args.man_tau,
+                                            a_net=a_net,
+                                            r_margin=r_margin,
+                                            novelty_pq=novelty_pq,
+                                            total_timesteps=total_timesteps,
+                                            fkm_obj=fkm_obj if args.use_model_based_rollout else None,
+                                            exp_w=args.rollout_exp_w if 0 < args.rollout_exp_w < 1 else 1.,
+                                            )
+                skip_ctrl_train = 0
+
+                if len(man_lossls) >= ceil(1000 / (args.step_update_interval * args.train_manager_freq)):
+                    writer.add_scalar("data/manager_actor_loss", man_lossls.mean('data/manager_actor_loss'), total_timesteps)
+                    writer.add_scalar("data/manager_critic_loss", man_lossls.mean('data/manager_critic_loss'), total_timesteps)
+                    writer.add_scalar("data/manager_goal_loss", man_lossls.mean('data/manager_goal_loss'), total_timesteps)
+                    writer.add_scalar("data/manager_landmark_loss", man_lossls.mean('data/manager_landmark_loss'), total_timesteps)
+                    writer.add_scalar("data/manager_follow_loss", man_lossls.mean('data/manager_follow_loss'), total_timesteps)
+                    writer.add_scalar("data/manager_osp_delta", man_lossls.mean('data/manager_osp_delta'), total_timesteps)
+                    man_lossls.reset()
+                else:
+                    man_lossls.push("data/manager_actor_loss", man_act_loss)
+                    man_lossls.push("data/manager_critic_loss", man_crit_loss)
+                    man_lossls.push("data/manager_goal_loss", man_goal_loss)
+                    man_lossls.push("data/manager_landmark_loss", man_ld_loss)
+                    man_lossls.push("data/manager_follow_loss", man_floss)
+                    man_lossls.push("data/manager_osp_delta", manager_policy.opc_delta_f.value)
+
+                if episode_num % 10 == 0:
+                    print("Manager actor loss: {:.3f}".format(man_act_loss))
+                    print("Manager critic loss: {:.3f}".format(man_crit_loss))
+                    print("Manager goal loss: {:.3f}".format(man_goal_loss))
+                    print("Manager landmark loss: {:.3f}".format(man_ld_loss))
+
         if done:
             # Update Novelty Priority Queue
             if ep_obs_seq is not None:
@@ -359,50 +463,69 @@ def run_higl(args):
             if total_timesteps != 0 and not just_loaded:
                 if episode_num % 10 == 0:
                     print("Episode {}".format(episode_num))
-                # Train controller
-                ctrl_act_loss, ctrl_crit_loss = controller_policy.train(controller_buffer,
-                                                                        episode_timesteps,
-                                                                        batch_size=args.ctrl_batch_size,
-                                                                        discount=args.ctrl_discount,
-                                                                        tau=args.ctrl_tau)
-                if episode_num % 10 == 0:
-                    print("Controller actor loss: {:.3f}".format(ctrl_act_loss))
-                    print("Controller critic loss: {:.3f}".format(ctrl_crit_loss))
 
-                writer.add_scalar("data/controller_actor_loss", ctrl_act_loss, total_timesteps)
-                writer.add_scalar("data/controller_critic_loss", ctrl_crit_loss, total_timesteps)
-                writer.add_scalar("data/controller_ep_rew", episode_reward, total_timesteps)
-
-                # Train manager
-                if timesteps_since_manager >= args.train_manager_freq:
-                    timesteps_since_manager = 0
-                    r_margin = (args.r_margin_pos + args.r_margin_neg) / 2
-
-                    man_act_loss, man_crit_loss, man_goal_loss, man_ld_loss, avg_scaled_norm_direction = \
-                        manager_policy.train(args.algo,
-                                             controller_policy,
-                                             manager_buffer,
-                                             controller_buffer,
-                                             ceil(episode_timesteps/args.train_manager_freq),
-                                             batch_size=args.man_batch_size,
-                                             discount=args.discount,
-                                             tau=args.man_tau,
-                                             a_net=a_net,
-                                             r_margin=r_margin,
-                                             novelty_pq=novelty_pq,
-                                             total_timesteps=total_timesteps
-                                             )
-
-                    writer.add_scalar("data/manager_actor_loss", man_act_loss, total_timesteps)
-                    writer.add_scalar("data/manager_critic_loss", man_crit_loss, total_timesteps)
-                    writer.add_scalar("data/manager_goal_loss", man_goal_loss, total_timesteps)
-                    writer.add_scalar("data/manager_landmark_loss", man_ld_loss, total_timesteps)
+                if not args.step_update:
+                    # Train controller
+                    use_mgp = args.ctrl_mgp_lambda > 0 and args.use_model_based_rollout and total_timesteps >= args.ctrl_gcmr_start_step
+                    use_osrp = args.ctrl_osrp_lambda > 0 and args.use_model_based_rollout and total_timesteps >= args.ctrl_gcmr_start_step
+                    ctrl_act_loss, ctrl_crit_loss = controller_policy.train(controller_buffer,
+                                                                            episode_timesteps,
+                                                                            batch_size=args.ctrl_batch_size,
+                                                                            discount=args.ctrl_discount,
+                                                                            tau=args.ctrl_tau,
+                                                                            fkm_obj=fkm_obj if (use_mgp or use_osrp) else None,
+                                                                            mgp_lambda=args.ctrl_mgp_lambda if use_mgp else .0,
+                                                                            osrp_lambda=args.ctrl_osrp_lambda if use_osrp else .0,
+                                                                            manage_replay_buffer=manager_buffer if use_osrp else None,
+                                                                            manage_actor=manager_policy.actor if use_osrp else None,
+                                                                            manage_critic=manager_policy.critic if use_osrp else None,
+                                                                            sg_scale=man_scale,
+                                                                            )
 
                     if episode_num % 10 == 0:
-                        print("Manager actor loss: {:.3f}".format(man_act_loss))
-                        print("Manager critic loss: {:.3f}".format(man_crit_loss))
-                        print("Manager goal loss: {:.3f}".format(man_goal_loss))
-                        print("Manager landmark loss: {:.3f}".format(man_ld_loss))
+                        print("Controller actor loss: {:.3f}".format(ctrl_act_loss['avg_act_loss']))
+                        print("Controller critic loss: {:.3f}".format(ctrl_crit_loss['avg_crit_loss']))
+                    writer.add_scalar("data/controller_actor_loss", ctrl_act_loss['avg_act_loss'], total_timesteps)
+                    writer.add_scalar("data/controller_actor_osrp_loss", ctrl_act_loss['avg_act_osrp_loss'], total_timesteps)
+                    writer.add_scalar("data/controller_critic_loss", ctrl_crit_loss['avg_crit_loss'], total_timesteps)
+                    writer.add_scalar("data/controller_mgp_loss", ctrl_crit_loss['avg_mgp_loss'], total_timesteps)
+                    writer.add_scalar("data/controller_auto_upperbounded_k", controller_policy._auto_upperbounded_k, total_timesteps)
+                    writer.add_scalar("data/controller_ep_rew", episode_reward, total_timesteps)
+
+                    # Train manager
+                    if timesteps_since_manager >= args.train_manager_freq:
+                        timesteps_since_manager = 0
+                        r_margin = (args.r_margin_pos + args.r_margin_neg) / 2
+
+                        man_act_loss, man_crit_loss, man_goal_loss, man_ld_loss, man_floss, avg_scaled_norm_direction = \
+                            manager_policy.train(args.algo,
+                                                controller_policy,
+                                                manager_buffer,
+                                                controller_buffer,
+                                                ceil(episode_timesteps/args.train_manager_freq),
+                                                batch_size=args.man_batch_size,
+                                                discount=args.discount,
+                                                tau=args.man_tau,
+                                                a_net=a_net,
+                                                r_margin=r_margin,
+                                                novelty_pq=novelty_pq,
+                                                total_timesteps=total_timesteps,
+                                                fkm_obj=fkm_obj if args.use_model_based_rollout else None,
+                                                exp_w=args.rollout_exp_w if 0 < args.rollout_exp_w < 1 else 1.,
+                                                )
+
+                        writer.add_scalar("data/manager_actor_loss", man_act_loss, total_timesteps)
+                        writer.add_scalar("data/manager_critic_loss", man_crit_loss, total_timesteps)
+                        writer.add_scalar("data/manager_goal_loss", man_goal_loss, total_timesteps)
+                        writer.add_scalar("data/manager_landmark_loss", man_ld_loss, total_timesteps)
+                        writer.add_scalar("data/manager_follow_loss", man_floss, total_timesteps)
+                        writer.add_scalar("data/manager_osp_delta", manager_policy.opc_delta_f.value, total_timesteps)
+
+                        if episode_num % 10 == 0:
+                            print("Manager actor loss: {:.3f}".format(man_act_loss))
+                            print("Manager critic loss: {:.3f}".format(man_crit_loss))
+                            print("Manager goal loss: {:.3f}".format(man_goal_loss))
+                            print("Manager landmark loss: {:.3f}".format(man_ld_loss))
 
                 # Evaluate
                 if timesteps_since_eval >= args.eval_freq:
@@ -411,7 +534,7 @@ def run_higl(args):
                     final_x, final_y, final_z, final_subgoal_x, final_subgoal_y, final_subgoal_z = \
                         evaluate_policy(env, args.env_name, manager_policy, controller_policy,
                                         calculate_controller_reward, args.ctrl_rew_scale,
-                                        args.manager_propose_freq, len(evaluations))
+                                        args.manager_propose_freq, len(evaluations), eval_episodes=args.eval_episode_num)
 
                     writer.add_scalar("eval/avg_ep_rew", avg_ep_rew, total_timesteps)
                     writer.add_scalar("eval/avg_controller_rew", avg_controller_rew, total_timesteps)
@@ -479,6 +602,18 @@ def run_higl(args):
                                 print("----- Adjacency network {} saved. -----".format(episode_num))
 
                         traj_buffer.reset()
+
+                # Update Forward Kinematic Model
+                enable_fkm = args.use_model_based_rollout and total_timesteps >= args.fkm_obj_start_step
+                if fkm_obj is not None and enable_fkm and (total_timesteps - fkm_obj_last_train_step) >= args.train_fkm_freq:
+                    if fkm_obj.trained:
+                        fkm_val_loss = fkm_obj.eval(manager_buffer, args.fkm_batch_size)
+                        writer.add_scalar("data/fkm_val_loss", fkm_val_loss, total_timesteps)
+
+                    fkm_loss = fkm_obj.train(manager_buffer, args.fkm_batch_size)
+                    writer.add_scalar("data/fkm_loss", fkm_loss, total_timesteps)
+
+                    fkm_obj_last_train_step = total_timesteps
 
                 # Update RND module
                 if RND is not None:
@@ -622,7 +757,7 @@ def run_higl(args):
     avg_ep_rew, avg_controller_rew, avg_steps, avg_env_finish, \
     final_x, final_y, final_z, final_subgoal_x, final_subgoal_y, final_subgoal_z = \
         evaluate_policy(env, args.env_name, manager_policy, controller_policy, calculate_controller_reward,
-                        args.ctrl_rew_scale, args.manager_propose_freq, len(evaluations))
+                        args.ctrl_rew_scale, args.manager_propose_freq, len(evaluations), eval_episodes=args.eval_episode_num)
 
     writer.add_scalar("eval/avg_ep_rew", avg_ep_rew, total_timesteps)
     writer.add_scalar("eval/avg_controller_rew", avg_controller_rew, total_timesteps)

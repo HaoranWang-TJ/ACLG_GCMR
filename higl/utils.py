@@ -158,7 +158,7 @@ def train_adj_net(a_net, states, adj_mat, optimizer, margin_pos, margin_neg,
     dataset = MetricDataset(states, adj_mat)
     if verbose:
         print('Totally {} training pairs.'.format(len(dataset)))
-    dataloader = Data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=False)
+    dataloader = Data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=False, generator=torch.Generator(device))
     n_batches = len(dataloader)
 
     loss_func = ContrastiveLoss(margin_pos, margin_neg)
@@ -350,8 +350,8 @@ class PriorityQueue:
         self.update_tensors()
 
     def update_tensors(self):
-        self.elems_state_tensor = torch.FloatTensor([elems.state for elems in self.elems]).to(device)
-        self.elems_achieved_goal_tensor = torch.FloatTensor([elems.achieved_goal for elems in self.elems]).to(device)
+        self.elems_state_tensor = torch.FloatTensor(np.array([elems.state for elems in self.elems])).to(device)
+        self.elems_achieved_goal_tensor = torch.FloatTensor(np.array([elems.achieved_goal for elems in self.elems])).to(device)
 
     # update novelty of similar states existing in storage to the newly encountered one.
     def discard_out_of_date(self, achieved_goal_list):
@@ -445,3 +445,60 @@ class RunningMeanStd(object):
         self.mean = new_mean
         self.var = new_var
         self.count = new_count
+
+
+class AutoLambda(object):
+    def __init__(self, init_value, update_rate):
+        self.init_value = init_value
+        assert 0 <= update_rate <= 1, 'The update rate should be in the range of 0 to 1!'
+        self.update_rate = update_rate
+        self._value = init_value
+
+    def update(self, x):
+        self._value = self.update_rate * x + (1 - self.update_rate) * self._value
+        return self._value
+
+    @property
+    def value(self):
+        return self._value
+
+    @property
+    def enable(self):
+        return self.init_value != 0 or self.update_rate != 0
+
+    @property
+    def is_dynamic(self):
+        return self.update_rate != 0
+
+class LossesList:
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.losses = dict()
+        self._len = 0
+
+    def __len__(self):
+        return self._len
+
+    def push(self, key, value):
+        if not (key in self.losses and isinstance(self.losses[key], list)):
+            self.losses[key] = list()
+        if torch.is_tensor(value):
+            value = value.cpu().data.numpy().mean()
+        self.losses[key].append(value)
+        self._len += 1
+        return self.losses[key]
+
+    def _mean(self, key):
+        if key is None or not (key in self.losses and isinstance(self.losses[key], list)):
+            return 0
+        else:
+            return np.mean(self.losses[key])
+
+    def mean(self, key=None):
+        if key is None:
+            return {_key: self._mean(key) for _key in self.losses}
+        else:
+            return self._mean(key)
